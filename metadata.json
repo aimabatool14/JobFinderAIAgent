@@ -1,0 +1,6 @@
+{
+  "name": "JobFinder AI",
+  "description": "AI-powered job finding and CV-job matching assistant with intelligent CV parsing, compatibility scoring, and tailoring recommendations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
