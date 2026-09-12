@@ -115,10 +115,10 @@ def render_sidebar(gemini_client: GeminiClient):
     # Status indicators
     st.sidebar.markdown("##### ⚙️ System Status")
     if gemini_client.is_configured:
-        st.sidebar.success("● Gemini AI: Connected (Live)")
+        st.sidebar.success("● Grok AI: Connected (Live)")
     else:
-        st.sidebar.info("○ Gemini AI: Demo / Heuristic Mode")
-        st.sidebar.caption("Provide GEMINI_API_KEY in .env or secrets to activate real-time AI calls.")
+        st.sidebar.info("○ Grok AI: Demo / Heuristic Mode")
+        st.sidebar.caption("Provide XAI_API_KEY in .env or secrets to activate real-time AI calls.")
 
     # CV State preview
     cv = st.session_state.get("cv_profile") or st.session_state.get("cv_analysis")
@@ -137,7 +137,7 @@ def render_sidebar(gemini_client: GeminiClient):
         st.sidebar.markdown(f"**Target Job:** {target_title[:28]}...")
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Built for Hackathon Demonstration • Powered by Google Gemini")
+    st.sidebar.caption("Built for Hackathon Demonstration • Powered by xAI Grok")
 
 
 def render_video_fallback():
@@ -158,7 +158,7 @@ def render_video_fallback():
                 Upload your CV to unlock instant semantic skills extraction, multi-dimensional job matching, and targeted resume optimization.
             </p>
             <div style="display: flex; justify-content: center; gap: 12px; flex-wrap: wrap;">
-                <span style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.15); padding: 6px 14px; border-radius: 6px; font-size: 0.8125rem;">⚡ Gemini 3.8 Flash</span>
+                <span style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.15); padding: 6px 14px; border-radius: 6px; font-size: 0.8125rem;">⚡ Grok 4.6</span>
                 <span style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.15); padding: 6px 14px; border-radius: 6px; font-size: 0.8125rem;">🔒 Zero Data Exposure</span>
                 <span style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.15); padding: 6px 14px; border-radius: 6px; font-size: 0.8125rem;">📊 ATS Breakdown</span>
                 <span style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.15); padding: 6px 14px; border-radius: 6px; font-size: 0.8125rem;">🎯 Transparent Compatibility</span>
@@ -387,7 +387,7 @@ def page_upload_cv(cv_analyzer: CVAnalyzer):
             )
 
             if st.button("Analyze My CV", type="primary", use_container_width=True, key="analyze_uploaded_cv_btn"):
-                with st.spinner("Parsing document and extracting structured profile with Gemini..."):
+                with st.spinner("Parsing document and extracting structured profile with Grok..."):
                     try:
                         text, format_name = parse_cv_file_detailed(uploaded_file)
                         analysis = cv_analyzer.analyze(text)
@@ -437,7 +437,7 @@ def page_upload_cv(cv_analyzer: CVAnalyzer):
             if not pasted_text.strip():
                 st.warning("Please paste some text first.")
             else:
-                with st.spinner("Analyzing text with Gemini..."):
+                with st.spinner("Analyzing text with Grok..."):
                     try:
                         analysis = cv_analyzer.analyze(pasted_text)
                         st.session_state["uploaded_cv"] = None
@@ -591,7 +591,7 @@ def page_job_match(job_matcher: JobMatcher):
         if not jd_input.strip():
             st.warning("Please paste or provide a job description first.")
         else:
-            with st.spinner("Analyzing job requirements, skills alignment, and experience depth with Gemini..."):
+            with st.spinner("Analyzing job requirements, skills alignment, and experience depth with Grok..."):
                 try:
                     # Extract JobProfile and compute MatchResult
                     job_profile = job_matcher.analyze_job(jd_input)
@@ -676,7 +676,7 @@ def page_cv_improvement(job_matcher: JobMatcher):
     c_imp1, c_imp2 = st.columns([3, 1])
     with c_imp1:
         if st.button("Generate Tailored CV Improvements", type="primary", use_container_width=True, key="generate_cv_improvements_btn"):
-            with st.spinner("Analyzing keyword density and bullet point impact with Gemini..."):
+            with st.spinner("Analyzing keyword density and bullet point impact with Grok..."):
                 try:
                     improvements = job_matcher.get_improvements(cv_text, jd_text)
                     st.session_state["cv_improvement_result"] = improvements
@@ -788,7 +788,7 @@ def page_about(gemini_client: GeminiClient):
         st.markdown(
             """
             - **Frontend Framework:** Streamlit (Reactive multi-page architecture)
-            - **AI Engine:** Google Gemini API (`gemini-3.8-flash` via `@google/genai`)
+            - **AI Engine:** xAI Grok API (`grok-4.6` via OpenAI-compatible SDK)
             - **Schema Validation:** Pydantic v2 & typed dataclasses
             - **Multi-Format Document Parsing:** `pypdf` (PDF), `python-docx` (DOCX), UTF-8 text readers
             """
@@ -819,11 +819,11 @@ def page_about(gemini_client: GeminiClient):
     c1, c2 = st.columns(2)
     with c1:
         if gemini_client.is_configured:
-            st.success("✅ Gemini API Key: Configured & Active")
+            st.success("✅ xAI API Key: Configured & Active")
             st.write(f"Active Model: `{gemini_client.model_name}`")
         else:
-            st.warning("⚠️ Gemini API Key: Not Configured (Running in Demo Mode)")
-            st.caption("Provide `GEMINI_API_KEY` in `.env` to activate live Gemini AI evaluations.")
+            st.warning("⚠️ xAI API Key: Not Configured (Running in Demo Mode)")
+            st.caption("Provide `XAI_API_KEY` in `.env` to activate live Grok AI evaluations.")
 
     with c2:
         cv = st.session_state.get("cv_profile") or st.session_state.get("cv_analysis")
