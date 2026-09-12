@@ -1,496 +1,229 @@
 """
-CV Analyzer module for JobFinder AI.
-Orchestrates raw text validation, AI extraction with Google Gemini,
-schema validation against CVProfile, and rich dashboard rendering.
+AI Client for JobFinder AI.
 
-Strict Truthfulness Constraint:
-Extracts ONLY facts supported by the CV text.
-Never invents skills, employers, degrees, certifications, experience, or projects.
-If any section is missing from the document, returns an empty value.
+NOTE: This module is still named `gemini_client.py` and the class is still
+called `GeminiClient` on purpose — every other file in the project
+(app.py, src/job_matcher.py, and presumably src/cv_analyzer.py) imports
+these exact names. Renaming them would require touching every file that
+imports this module. Internally, this now calls the xAI Grok API via its
+OpenAI-compatible endpoint instead of Google Gemini.
+
+Required environment variable: XAI_API_KEY
+Optional environment variable: GROK_MODEL (defaults to "grok-4.6")
+
+If you'd rather rename this module/class to something Grok-specific,
+say so and I'll give you the exact import-line changes needed in
+app.py, src/job_matcher.py, and src/cv_analyzer.py.
 """
 
-import re
+import os
+import json
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
+
+logger = logging.getLogger("JobFinderAI.GeminiClient")
+
+DEFAULT_MODEL = os.environ.get("GROK_MODEL", "grok-4.6")
+XAI_BASE_URL = "https://api.x.ai/v1"
 
 try:
-    import streamlit as st
+    from openai import OpenAI, APIError, RateLimitError as _OpenAIRateLimitError
+    HAS_OPENAI_SDK = True
 except ImportError:
-    st = None
-
-from src.gemini_client import (
-    GeminiClient,
-    GeminiKeyMissingError,
-    GeminiRateLimitError,
-    GeminiResponseFormatError,
-    GeminiError,
-)
-from src.schemas import CVProfile, validate_schema
-
-logger = logging.getLogger("JobFinderAI.CVAnalyzer")
+    HAS_OPENAI_SDK = False
+    APIError = Exception
+    _OpenAIRateLimitError = Exception
 
 
-class CVAnalysisError(Exception):
-    """Application-level exception for CV analysis errors with friendly messages."""
+# ---------------------------------------------------------------------------
+# Exceptions (names preserved so job_matcher.py's except clauses keep working)
+# ---------------------------------------------------------------------------
+class GeminiError(Exception):
+    """Generic error talking to the AI backend (now Grok/xAI)."""
     pass
 
 
-# Catalog of recognized skills for truthful text extraction
-COMMON_TECH_SKILLS = [
-    "Python", "JavaScript", "TypeScript", "Java", "C++", "C#", "Go", "Rust", "PHP", "Ruby", "Swift", "Kotlin",
-    "React", "Angular", "Vue.js", "Next.js", "Node.js", "Express", "Django", "FastAPI", "Flask", "Spring Boot",
-    ".NET", "SQL", "PostgreSQL", "MySQL", "MongoDB", "Redis", "SQLite", "GraphQL", "REST APIs", "gRPC",
-    "Docker", "Kubernetes", "AWS", "Google Cloud", "GCP", "Azure", "Terraform", "CI/CD", "GitHub Actions",
-    "Git", "Linux", "Tailwind CSS", "HTML5", "CSS3", "PyTorch", "TensorFlow", "Pandas", "NumPy", "Scikit-Learn",
-]
-
-COMMON_SOFT_SKILLS = [
-    "Problem Solving", "Team Leadership", "Agile Methodologies", "Scrum", "Communication",
-    "Cross-functional Collaboration", "Critical Thinking", "Project Management", "Mentorship",
-    "Time Management", "Adaptability", "Analytical Thinking",
-]
+class GeminiKeyMissingError(GeminiError):
+    """Raised when XAI_API_KEY is not configured."""
+    pass
 
 
-def extract_supported_cv_facts(cv_text: str) -> Dict[str, Any]:
+class GeminiRateLimitError(GeminiError):
+    """Raised when the xAI API returns a rate-limit response."""
+    pass
+
+
+class GeminiResponseFormatError(GeminiError):
+    """Raised when the xAI API response is not valid/parseable JSON."""
+    pass
+
+
+def get_api_key() -> Optional[str]:
+    """Read the xAI API key from the environment."""
+    return os.environ.get("XAI_API_KEY") or None
+
+
+def _extract_json(text: str) -> Dict[str, Any]:
     """
-    Extract ONLY facts directly supported by the CV text.
-    Never invents degrees, companies, projects, or certifications.
-    Missing fields remain empty lists or empty strings.
+    Grok's chat completion returns plain text; extract the JSON object from it,
+    tolerating markdown code fences if the model wraps its answer in ```json ... ```.
     """
-    if not cv_text:
-        return {
-            "name": "Candidate",
-            "summary": "",
-            "professional_summary": "",
-            "skills": [],
-            "technical_skills": [],
-            "soft_skills": [],
-            "education": [],
-            "certifications": [],
-            "experience": [],
-            "work_experience": [],
-            "projects": [],
-            "languages": [],
-            "total_experience_years": None,
-            "years_of_experience": None,
-        }
-
-    lines = [line.strip() for line in cv_text.split("\n") if line.strip()]
-    text_lower = cv_text.lower()
-
-    # 1. Candidate Name (detect from top lines, ignoring headers like "Resume" or "CV")
-    name = "Candidate"
-    for line in lines[:5]:
-        cleaned_line = re.sub(r"[^a-zA-Z\s\.\-]", "", line).strip()
-        words = cleaned_line.split()
-        if 2 <= len(words) <= 4:
-            if not any(k in cleaned_line.lower() for k in ["curriculum", "resume", "vitae", "profile", "summary", "contact", "email", "phone"]):
-                name = cleaned_line
-                break
-
-    # 2. Extract technical skills strictly present in the text
-    found_tech = []
-    for skill in COMMON_TECH_SKILLS:
-        pattern = r"\b" + re.escape(skill.lower()) + r"\b"
-        if re.search(pattern, text_lower):
-            found_tech.append(skill)
-
-    # 3. Extract soft skills strictly present in the text
-    found_soft = []
-    for soft in COMMON_SOFT_SKILLS:
-        pattern = r"\b" + re.escape(soft.lower()) + r"\b"
-        if re.search(pattern, text_lower):
-            found_soft.append(soft)
-
-    all_skills = list(dict.fromkeys(found_tech + found_soft))
-
-    # 4. Extract years of experience only if explicitly mentioned
-    yoe = None
-    yoe_match = re.search(r"(\d+(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?)(?:\s+of)?\s+experience", text_lower)
-    if yoe_match:
-        try:
-            yoe = float(yoe_match.group(1))
-        except ValueError:
-            yoe = None
-
-    # 5. Extract Education only if supported by text keywords
-    education = []
-    edu_patterns = [
-        r"(bachelor(?:'s)?|b\.?s\.?|b\.?a\.?|master(?:'s)?|m\.?s\.?|m\.?a\.?|ph\.?d\.?|diploma|associate)\s+(?:in|of)?\s+([^\n,\.]+)",
-    ]
-    for p in edu_patterns:
-        matches = re.finditer(p, text_lower)
-        for m in matches:
-            degree_title = m.group(0).title()
-            education.append({
-                "degree": degree_title,
-                "institution": "Institution mentioned in CV",
-                "year": None,
-                "details": None,
-            })
-            break  # Keep concise
-
-    # 6. Extract Work Experience only if role/employment indicators exist
-    experience = []
-    role_pattern = r"(?:senior|junior|lead|principal|staff)?\s*(?:software engineer|developer|data scientist|manager|analyst|consultant|architect|intern)\b"
-    role_matches = list(re.finditer(role_pattern, text_lower))
-    if role_matches:
-        for rm in role_matches[:3]:
-            role_name = rm.group(0).strip().title()
-            experience.append({
-                "role": role_name,
-                "company": "Organization from CV",
-                "duration": "Duration specified in CV",
-                "years": None,
-                "bullet_points": ["Verified employment experience documented in CV text."],
-            })
-
-    # 7. Extract Certifications only if explicit certification names are present
-    certifications = []
-    # Known specific certifications
-    known_certs = [
-        "AWS Certified Solutions Architect", "AWS Certified Cloud Practitioner", "AWS Certified Developer",
-        "Google Cloud Certified", "GCP Professional Cloud Architect", "Azure Fundamentals",
-        "Certified Kubernetes Administrator", "CKA", "CKAD", "PMP", "Scrum Master", "CISSP", "CompTIA Security+"
-    ]
-    for cert in known_certs:
-        if re.search(r"\b" + re.escape(cert.lower()) + r"\b", text_lower):
-            certifications.append(cert)
-
-    # Check for "Certified in <field>" or "Certifications: <name>"
-    cert_inline_matches = re.finditer(r"(?:certified in|certification[:\s]+)\s*([A-Za-z0-9\+\s]{3,35})", cv_text, re.IGNORECASE)
-    for cim in cert_inline_matches:
-        cand = cim.group(1).strip()
-        # Ensure it's not a negation or generic sentence
-        if not any(neg in cand.lower() for neg in ["none", "no ", "listed", "required", "n/a"]):
-            if len(cand) > 3 and cand.title() not in certifications:
-                certifications.append(cand.title())
-
-    # 8. Extract Projects only if explicit project section present
-    projects = []
-    if "project" in text_lower:
-        proj_matches = re.findall(r"(?:project:?|built|developed|created)\s+([A-Za-z0-9\s\-]{4,30})", cv_text, re.IGNORECASE)
-        for pm in proj_matches[:2]:
-            clean_p = pm.strip()
-            if len(clean_p) > 3 and not any(k in clean_p.lower() for k in ["experience", "education", "skill"]):
-                projects.append({
-                    "name": clean_p,
-                    "description": "Project highlighted in CV text.",
-                    "technologies": [t for t in found_tech[:3]],
-                    "url": None,
-                })
-
-    # 9. Extract Spoken/Written Languages
-    languages = []
-    for lang in ["English", "Spanish", "French", "German", "Mandarin", "Arabic", "Hindi", "Portuguese", "Japanese"]:
-        if re.search(r"\b" + re.escape(lang.lower()) + r"\b", text_lower):
-            languages.append(lang)
-
-    # 10. Summary
-    summary = ""
-    summary_match = re.search(r"(?:summary|profile|about me|objective)[:\s]+([^\n]+(?:\n[^\n]+){1,3})", cv_text, re.IGNORECASE)
-    if summary_match:
-        summary = summary_match.group(1).strip()
-    elif found_tech:
-        summary = f"Candidate with verified skills in {', '.join(found_tech[:5])} based on document analysis."
-
-    return {
-        "name": name,
-        "summary": summary,
-        "professional_summary": summary,
-        "skills": all_skills,
-        "technical_skills": found_tech,
-        "soft_skills": found_soft,
-        "education": education,
-        "certifications": certifications,
-        "experience": experience,
-        "work_experience": experience,
-        "projects": projects,
-        "languages": languages,
-        "total_experience_years": yoe,
-        "years_of_experience": yoe,
-    }
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(cleaned[start:end + 1])
+        raise
 
 
-def generate_fallback_cv_analysis(cv_text: str) -> Dict[str, Any]:
+class GeminiClient:
     """
-    Intelligent, truthful fallback analyzer when Gemini API is unconfigured or in offline test mode.
-    Strictly extracts ONLY facts found in the CV text without inventing credentials.
-    """
-    return extract_supported_cv_facts(cv_text)
+    Thin wrapper around the xAI Grok API (OpenAI-compatible Chat Completions
+    endpoint). Public interface kept identical to the original Gemini-backed
+    client so app.py / job_matcher.py / cv_analyzer.py do not need to change:
 
-
-class CVAnalyzer:
-    """
-    Handles CV text analysis using Google Gemini and structured CVProfile validation.
-    Enforces truthfulness: never invents skills, employers, or degrees.
+      - is_configured (bool property)
+      - model_name (str property)
+      - analyze_job(job_description) -> dict
+      - match_cv_to_job(cv_data, job_description) -> dict
+      - get_cv_improvement_suggestions(cv_text, job_description) -> dict
     """
 
-    def __init__(self, gemini_client: Optional[GeminiClient] = None):
-        self.client = gemini_client or GeminiClient()
+    def __init__(self, api_key: Optional[str] = None, model_name: Optional[str] = None):
+        self.api_key = api_key or get_api_key()
+        self.model_name = model_name or DEFAULT_MODEL
+        self._client = None
 
-    def analyze(self, cv_text: str, force_demo: bool = False) -> Dict[str, Any]:
-        """
-        Analyze CV text and return a validated dictionary adhering to the CVProfile schema.
+        if self.api_key and HAS_OPENAI_SDK:
+            try:
+                self._client = OpenAI(api_key=self.api_key, base_url=XAI_BASE_URL)
+            except Exception as exc:
+                logger.warning("Failed to initialize xAI client: %s", exc)
+                self._client = None
 
-        Flow:
-            raw text -> length validation -> Gemini CV parser -> CVProfile schema validation -> normalized dictionary.
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.api_key and HAS_OPENAI_SDK and self._client is not None)
 
-        Raises:
-            CVAnalysisError: If text is invalid or analysis fails with a user-friendly message.
-        """
-        if not cv_text or not cv_text.strip():
-            raise CVAnalysisError("The CV text is empty. Please provide a valid resume or document.")
-
-        words = cv_text.strip().split()
-        if len(words) < 10:
-            raise CVAnalysisError(
-                f"The provided CV text contains only {len(words)} word(s). "
-                f"Please upload or paste a complete resume containing your experience and skills."
+    # ------------------------------------------------------------------
+    # Internal helper
+    # ------------------------------------------------------------------
+    def _chat_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.3) -> Dict[str, Any]:
+        if not self.is_configured:
+            raise GeminiKeyMissingError(
+                "XAI_API_KEY is not set (or the 'openai' package is not installed). "
+                "Set the XAI_API_KEY environment variable to enable live Grok calls."
             )
 
-        # In force_demo mode or if no API key is configured, use the truthful fallback parser
-        if force_demo or not self.client.is_configured:
-            logger.info("Gemini API key unconfigured or demo mode requested; using factual local extractor.")
-            fallback = extract_supported_cv_facts(cv_text)
-            return validate_schema(CVProfile, fallback)
-
         try:
-            # 1. Send to Gemini for structured JSON extraction
-            raw_result = self.client.analyze_cv(cv_text)
-
-            # 2. Validate against CVProfile schema
-            validated = validate_schema(CVProfile, raw_result)
-
-            # 3. Defensive check: ensure critical aliases are synced
-            if not validated.get("professional_summary") and validated.get("summary"):
-                validated["professional_summary"] = validated["summary"]
-            if not validated.get("work_experience") and validated.get("experience"):
-                validated["work_experience"] = validated["experience"]
-            if validated.get("years_of_experience") is None and validated.get("total_experience_years") is not None:
-                validated["years_of_experience"] = validated["total_experience_years"]
-
-            return validated
-
-        except GeminiKeyMissingError as exc:
-            logger.warning("GeminiKeyMissingError encountered: %s", exc)
-            fallback = extract_supported_cv_facts(cv_text)
-            fallback["_notice"] = "Analyzed using local factual extractor (Gemini API key not configured)."
-            return validate_schema(CVProfile, fallback)
-
-        except GeminiRateLimitError as exc:
-            logger.warning("GeminiRateLimitError: %s. Falling back to local extractor.", exc)
-            fallback = extract_supported_cv_facts(cv_text)
-            fallback["_notice"] = "Gemini API rate limit reached. Displaying facts extracted via local engine."
-            return validate_schema(CVProfile, fallback)
-
-        except GeminiResponseFormatError as exc:
-            logger.warning("GeminiResponseFormatError: %s. Falling back to local extractor.", exc)
-            fallback = extract_supported_cv_facts(cv_text)
-            fallback["_notice"] = "Gemini model output had non-standard structure; profile extracted via local factual engine."
-            return validate_schema(CVProfile, fallback)
-
-        except GeminiError as exc:
-            logger.warning("Gemini API error (%s); falling back to local factual extractor.", exc)
-            fallback = extract_supported_cv_facts(cv_text)
-            fallback["_notice"] = f"AI service notice ({exc}); profile extracted via local factual engine."
-            return validate_schema(CVProfile, fallback)
-
+            response = self._client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+                response_format={"type": "json_object"},
+            )
+        except _OpenAIRateLimitError as exc:
+            raise GeminiRateLimitError(f"xAI rate limit hit: {exc}") from exc
+        except APIError as exc:
+            raise GeminiError(f"xAI API error: {exc}") from exc
         except Exception as exc:
-            logger.error("Unexpected error analyzing CV: %s", exc)
-            raise CVAnalysisError(
-                "An unexpected issue occurred while analyzing your CV. "
-                "Please check the document format and try again."
-            )
+            raise GeminiError(f"Unexpected error calling xAI API: {exc}") from exc
 
-
-def render_cv_dashboard(cv_data: Dict[str, Any], show_success_state: bool = True) -> None:
-    """
-    Renders the professional CV analysis dashboard in Streamlit.
-    Displays:
-    - Clear 'CV analyzed successfully' banner
-    - Candidate summary
-    - Skills (all, technical, and soft skills)
-    - Education
-    - Work Experience
-    - Certifications
-    - Projects
-    - Languages
-    """
-    if st is None:
-        return
-
-    if not cv_data:
-        st.warning("No CV analysis data available to display.")
-        return
-
-    # 1. Success State Banner
-    if show_success_state:
-        st.markdown(
-            """
-            <div style="background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
-                        border: 1px solid #10b981; border-radius: 12px; padding: 16px 20px;
-                        margin-bottom: 24px; display: flex; align-items: center; justify-content: space-between;">
-                <div style="display: flex; align-items: center; gap: 14px;">
-                    <div style="background: #10b981; color: white; width: 36px; height: 36px;
-                                border-radius: 50%; display: flex; align-items: center; justify-content: center;
-                                font-size: 1.25rem; font-weight: bold;">✓</div>
-                    <div>
-                        <div style="font-weight: 700; color: #065f46; font-size: 1.05rem;">CV Analyzed Successfully</div>
-                        <div style="color: #047857; font-size: 0.875rem;">Structured profile extracted and validated against candidate credentials.</div>
-                    </div>
-                </div>
-                <div style="background: white; border: 1px solid #a7f3d0; color: #065f46; font-size: 0.8125rem;
-                            font-weight: 600; padding: 4px 10px; border-radius: 6px;">
-                    Verified Extraction
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    # Notice if fallback occurred
-    if "_notice" in cv_data:
-        st.info(f"ℹ️ {cv_data['_notice']}")
-
-    candidate_name = cv_data.get("name") or "Candidate"
-    st.markdown(f"## Candidate Profile: {candidate_name}")
-
-    # 2. Professional Summary Card
-    summary_text = cv_data.get("professional_summary") or cv_data.get("summary") or "No professional summary provided in CV."
-    st.markdown(
-        f"""
-        <div class="metric-card" style="margin-bottom: 20px;">
-            <h4 style="margin-top: 0; margin-bottom: 8px; color: #0f172a; font-size: 1.1rem; display: flex; align-items: center; gap: 8px;">
-                <span>👤</span> Professional Summary
-            </h4>
-            <p style="color: #334155; line-height: 1.65; margin: 0; font-size: 0.95rem;">
-                {summary_text}
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # 3. High-Level Metrics Row
-    tech_skills = cv_data.get("technical_skills") or []
-    soft_skills = cv_data.get("soft_skills") or []
-    work_exp = cv_data.get("work_experience") or cv_data.get("experience") or []
-    education = cv_data.get("education") or []
-    certs = cv_data.get("certifications") or []
-    projects = cv_data.get("projects") or []
-    languages = cv_data.get("languages") or []
-
-    yoe = cv_data.get("years_of_experience") or cv_data.get("total_experience_years")
-    if yoe is not None:
+        content = response.choices[0].message.content
         try:
-            yoe_val = float(yoe)
-            yoe_str = f"{yoe_val:.1f} yrs"
-        except (ValueError, TypeError):
-            yoe_str = f"{str(yoe)} yrs"
-    else:
-        yoe_str = "Documented"
+            return _extract_json(content)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise GeminiResponseFormatError(f"xAI response was not valid JSON: {exc}") from exc
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Experience", yoe_str)
-    with col2:
-        st.metric("Technical Skills", len(tech_skills))
-    with col3:
-        st.metric("Work Positions", len(work_exp))
-    with col4:
-        st.metric("Education Entries", len(education))
+    # ------------------------------------------------------------------
+    # Public methods expected by the rest of the app
+    # ------------------------------------------------------------------
+    def analyze_cv(self, cv_text: str) -> Dict[str, Any]:
+        """
+        Extract a structured CVProfile from raw CV text via Grok.
+        Called by src/cv_analyzer.py's CVAnalyzer.analyze().
+        Strict truthfulness: never invent skills, employers, degrees, or experience.
+        """
+        system_prompt = (
+            "You are a precise resume/CV parser. Extract ONLY facts explicitly present "
+            "in the CV text. NEVER invent employers, degrees, certifications, skills, or "
+            "projects. If a section is missing, return an empty list or empty string for it. "
+            "Respond with a single JSON object containing exactly these keys: "
+            "name (string), summary (string), professional_summary (string), "
+            "skills (array of strings), technical_skills (array of strings), "
+            "soft_skills (array of strings), "
+            "education (array of objects with degree, institution, year, details), "
+            "certifications (array of strings), "
+            "experience (array of objects with role, company, duration, bullet_points), "
+            "work_experience (same content as experience), "
+            "projects (array of objects with name, description, technologies, url), "
+            "languages (array of strings), "
+            "total_experience_years (number or null), "
+            "years_of_experience (same value as total_experience_years). "
+            "Respond with ONLY the JSON object, no commentary."
+        )
+        return self._chat_json(system_prompt, cv_text)
 
-    st.markdown("---")
+    def analyze_job(self, job_description: str) -> Dict[str, Any]:
+        """Extract a structured JobProfile from a raw job description via Grok."""
+        system_prompt = (
+            "You are an expert technical recruiter. Extract a structured job profile "
+            "from the job description as a single JSON object with keys: "
+            "title (string), required_skills (array of strings), preferred_skills "
+            "(array of strings), responsibilities (array of strings), "
+            "experience_requirements (string), education_requirements (string), "
+            "certifications (array of strings), keywords (array of strings). "
+            "Respond with ONLY the JSON object, no commentary."
+        )
+        return self._chat_json(system_prompt, job_description)
 
-    # 4. Skills Breakdown Card
-    st.markdown("### 🛠️ Skills & Competencies")
-    sc1, sc2 = st.columns(2)
+    def match_cv_to_job(self, cv_data: Dict[str, Any], job_description: str) -> Dict[str, Any]:
+        """Produce a MatchResult-shaped dict comparing a CV profile to a job description."""
+        system_prompt = (
+            "You are an objective, non-discriminatory CV-to-job matching engine. "
+            "Given a candidate's CV profile (JSON) and a job description, evaluate ONLY "
+            "verified textual evidence in the CV. NEVER factor in protected "
+            "characteristics (name, gender, age, photo, nationality, religion, "
+            "ethnicity, etc.). Never invent skills, experience, or credentials. "
+            "Respond with a single JSON object containing: overall_score (0-100 int), "
+            "compatibility_label (string), matching_skills (array), "
+            "partially_matching_skills (array), missing_skills (array), "
+            "experience_match (string), education_match (string), "
+            "project_relevance (string), strengths (array of strings), "
+            "weaknesses_and_gaps (array of strings), recommendations (array of strings), "
+            "why_matched (string), biggest_gaps (string), "
+            "score_calculation_explanation (string). "
+            "Respond with ONLY the JSON object, no commentary."
+        )
+        user_prompt = (
+            f"CANDIDATE CV PROFILE (JSON):\n{json.dumps(cv_data, default=str)}\n\n"
+            f"JOB DESCRIPTION:\n{job_description}"
+        )
+        return self._chat_json(system_prompt, user_prompt)
 
-    with sc1:
-        st.markdown("#### Technical Competencies")
-        if tech_skills:
-            pills = "".join([f'<span class="pill-tag pill-blue">{s}</span>' for s in tech_skills])
-            st.markdown(f'<div style="margin-bottom: 12px; line-height: 2;">{pills}</div>', unsafe_allow_html=True)
-        else:
-            st.info("No technical skills explicitly identified in the CV text.")
-
-    with sc2:
-        st.markdown("#### Soft Skills & Methodologies")
-        if soft_skills:
-            pills = "".join([f'<span class="pill-tag pill-green">{s}</span>' for s in soft_skills])
-            st.markdown(f'<div style="margin-bottom: 12px; line-height: 2;">{pills}</div>', unsafe_allow_html=True)
-        else:
-            st.info("No soft skills or methodologies explicitly identified.")
-
-    st.markdown("---")
-
-    # 5. Work Experience Section
-    st.markdown("### 💼 Work Experience")
-    if work_exp:
-        for idx, exp in enumerate(work_exp):
-            role = exp.get("role", "Professional Role")
-            company = exp.get("company", "Company / Organization")
-            duration = exp.get("duration", "Dates not specified")
-            bullet_points = exp.get("bullet_points") or []
-
-            with st.expander(f"**{role}** at **{company}** — *{duration}*", expanded=(idx == 0)):
-                if bullet_points:
-                    for bp in bullet_points:
-                        st.markdown(f"- {bp}")
-                else:
-                    st.write("Role documented in CV without detailed accomplishment bullet points.")
-    else:
-        st.info("No formal work experience entries detected in the CV text.")
-
-    st.markdown("---")
-
-    # 6. Education & Certifications
-    ed_col, pr_col = st.columns(2)
-
-    with ed_col:
-        st.markdown("### 🎓 Education & Credentials")
-        if education:
-            for edu in education:
-                degree = edu.get("degree", "Degree / Certification")
-                inst = edu.get("institution", "Institution")
-                yr = edu.get("year") or ""
-                details = edu.get("details")
-
-                st.markdown(f"**{degree}**")
-                st.caption(f"{inst} {('• ' + yr) if yr else ''}")
-                if details:
-                    st.markdown(f"<span style='color: #475569; font-size: 0.9rem;'>{details}</span>", unsafe_allow_html=True)
-                st.write("")
-        else:
-            st.info("No formal education entries detected.")
-
-        if certs:
-            st.markdown("#### 📜 Certifications & Licenses")
-            for c in certs:
-                st.markdown(f"- **{c}**")
-
-        if languages:
-            st.markdown("#### 🌐 Languages")
-            st.markdown(", ".join([f"**{lang}**" for lang in languages]))
-
-    with pr_col:
-        st.markdown("### 🚀 Featured Projects")
-        if projects:
-            for p in projects:
-                p_name = p.get("name", "Project")
-                p_desc = p.get("description", "")
-                p_techs = p.get("technologies") or []
-                p_url = p.get("url")
-
-                st.markdown(f"**{p_name}**")
-                if p_desc:
-                    st.write(p_desc)
-                if p_techs:
-                    pills = "".join([f'<span class="pill-tag pill-slate">{t}</span>' for t in p_techs])
-                    st.markdown(f'<div style="margin-bottom: 8px; line-height: 1.8;">{pills}</div>', unsafe_allow_html=True)
-                if p_url and (str(p_url).startswith("http://") or str(p_url).startswith("https://")):
-                    st.markdown(f"[🔗 View Project Repository]({p_url})")
-                st.write("")
-        else:
-            st.info("No distinct personal or featured projects section detected.")
+    def get_cv_improvement_suggestions(self, cv_text: str, job_description: str) -> Dict[str, Any]:
+        """Produce truthful, ethical CV tailoring suggestions for a target job."""
+        system_prompt = (
+            "You are an ethical resume coach. Suggest CV improvements strictly "
+            "derived from the candidate's real, provided experience. NEVER fabricate "
+            "roles, employers, degrees, or metrics. Respond with a single JSON object "
+            "containing: missing_keywords (array of strings), skills_to_emphasize "
+            "(array of strings), weak_sections (array of strings), "
+            "suggested_bullet_point_improvements (array of objects, each with "
+            "original_or_section, suggested_revision, reason), "
+            "tailoring_recommendations (array of strings), ethical_guidance (string). "
+            "Respond with ONLY the JSON object, no commentary."
+        )
+        user_prompt = f"CANDIDATE CV TEXT:\n{cv_text}\n\nTARGET JOB DESCRIPTION:\n{job_description}"
+        return self._chat_json(system_prompt, user_prompt)
