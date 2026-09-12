@@ -53,6 +53,11 @@ class GeminiRateLimitError(GeminiError):
     pass
 
 
+class GeminiResponseFormatError(GeminiError):
+    """Raised when the xAI API response is not valid/parseable JSON."""
+    pass
+
+
 def get_api_key() -> Optional[str]:
     """Read the xAI API key from the environment."""
     return os.environ.get("XAI_API_KEY") or None
@@ -139,11 +144,37 @@ class GeminiClient:
         try:
             return _extract_json(content)
         except (json.JSONDecodeError, ValueError) as exc:
-            raise GeminiError(f"xAI response was not valid JSON: {exc}") from exc
+            raise GeminiResponseFormatError(f"xAI response was not valid JSON: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Public methods expected by the rest of the app
     # ------------------------------------------------------------------
+    def analyze_cv(self, cv_text: str) -> Dict[str, Any]:
+        """
+        Extract a structured CVProfile from raw CV text via Grok.
+        Called by src/cv_analyzer.py's CVAnalyzer.analyze().
+        Strict truthfulness: never invent skills, employers, degrees, or experience.
+        """
+        system_prompt = (
+            "You are a precise resume/CV parser. Extract ONLY facts explicitly present "
+            "in the CV text. NEVER invent employers, degrees, certifications, skills, or "
+            "projects. If a section is missing, return an empty list or empty string for it. "
+            "Respond with a single JSON object containing exactly these keys: "
+            "name (string), summary (string), professional_summary (string), "
+            "skills (array of strings), technical_skills (array of strings), "
+            "soft_skills (array of strings), "
+            "education (array of objects with degree, institution, year, details), "
+            "certifications (array of strings), "
+            "experience (array of objects with role, company, duration, bullet_points), "
+            "work_experience (same content as experience), "
+            "projects (array of objects with name, description, technologies, url), "
+            "languages (array of strings), "
+            "total_experience_years (number or null), "
+            "years_of_experience (same value as total_experience_years). "
+            "Respond with ONLY the JSON object, no commentary."
+        )
+        return self._chat_json(system_prompt, cv_text)
+
     def analyze_job(self, job_description: str) -> Dict[str, Any]:
         """Extract a structured JobProfile from a raw job description via Grok."""
         system_prompt = (
