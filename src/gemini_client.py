@@ -1,380 +1,198 @@
 """
-Gemini Client module for JobFinder AI.
-Centralizes all interactions with Google Gemini models using the official Google GenAI Python SDK.
-Guarantees zero API key leakage, structured JSON validation, and graceful exception handling.
+AI Client for JobFinder AI.
+
+NOTE: This module is still named `gemini_client.py` and the class is still
+called `GeminiClient` on purpose — every other file in the project
+(app.py, src/job_matcher.py, and presumably src/cv_analyzer.py) imports
+these exact names. Renaming them would require touching every file that
+imports this module. Internally, this now calls the xAI Grok API via its
+OpenAI-compatible endpoint instead of Google Gemini.
+
+Required environment variable: XAI_API_KEY
+Optional environment variable: GROK_MODEL (defaults to "grok-4.6")
+
+If you'd rather rename this module/class to something Grok-specific,
+say so and I'll give you the exact import-line changes needed in
+app.py, src/job_matcher.py, and src/cv_analyzer.py.
 """
 
 import os
 import json
-import re
 import logging
 from typing import Dict, Any, Optional
 
-from src.schemas import (
-    CVProfile,
-    JobProfile,
-    MatchResult,
-    CVImprovementResult,
-    validate_schema,
-)
-from src.prompts import (
-    CV_ANALYSIS_SYSTEM_PROMPT,
-    CV_ANALYSIS_USER_PROMPT,
-    JOB_ANALYSIS_SYSTEM_PROMPT,
-    JOB_ANALYSIS_USER_PROMPT,
-    JOB_MATCH_SYSTEM_PROMPT,
-    JOB_MATCH_USER_PROMPT,
-    CV_IMPROVEMENT_SYSTEM_PROMPT,
-    CV_IMPROVEMENT_USER_PROMPT,
-)
-
 logger = logging.getLogger("JobFinderAI.GeminiClient")
 
-# Centralized default model configuration
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MODEL = os.environ.get("GROK_MODEL", "grok-4.6")
+XAI_BASE_URL = "https://api.x.ai/v1"
+
+try:
+    from openai import OpenAI, APIError, RateLimitError as _OpenAIRateLimitError
+    HAS_OPENAI_SDK = True
+except ImportError:
+    HAS_OPENAI_SDK = False
+    APIError = Exception
+    _OpenAIRateLimitError = Exception
 
 
+# ---------------------------------------------------------------------------
+# Exceptions (names preserved so job_matcher.py's except clauses keep working)
+# ---------------------------------------------------------------------------
 class GeminiError(Exception):
-    """Base exception for Gemini client operations."""
+    """Generic error talking to the AI backend (now Grok/xAI)."""
     pass
 
 
 class GeminiKeyMissingError(GeminiError):
-    """Raised when GEMINI_API_KEY is not configured in secrets or environment."""
+    """Raised when XAI_API_KEY is not configured."""
     pass
 
 
 class GeminiRateLimitError(GeminiError):
-    """Raised when the Gemini API quota or rate limit is reached."""
-    pass
-
-
-class GeminiResponseFormatError(GeminiError):
-    """Raised when model response cannot be parsed into the expected JSON structure."""
+    """Raised when the xAI API returns a rate-limit response."""
     pass
 
 
 def get_api_key() -> Optional[str]:
+    """Read the xAI API key from the environment."""
+    return os.environ.get("XAI_API_KEY") or None
+
+
+def _extract_json(text: str) -> Dict[str, Any]:
     """
-    Retrieve Gemini API key from environment variables or Streamlit secrets safely.
-    Ensures keys are never logged, printed, or sent to client-side code.
+    Grok's chat completion returns plain text; extract the JSON object from it,
+    tolerating markdown code fences if the model wraps its answer in ```json ... ```.
     """
-    # 1. Environment variable (standard for local dev & containers)
-    key = os.getenv("GEMINI_API_KEY")
-    if key and key.strip() and key != "MY_GEMINI_API_KEY":
-        return key.strip()
-
-    # 2. Streamlit secrets (standard for Streamlit Community Cloud)
-    try:
-        import streamlit as st
-        if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-            secret_key = st.secrets["GEMINI_API_KEY"]
-            if secret_key and secret_key.strip():
-                return secret_key.strip()
-    except Exception:
-        pass
-
-    return None
-
-
-def clean_and_parse_json(raw_text: str) -> Dict[str, Any]:
-    """
-    Safely extract and parse JSON from raw model text.
-    Strips markdown code fences, backticks, comments, and boundary whitespace.
-    """
-    if not raw_text or not raw_text.strip():
-        raise GeminiResponseFormatError("Model returned an empty response.")
-
-    cleaned = raw_text.strip()
-
-    # Strip markdown code blocks (```json ... ``` or ``` ... ```)
+    cleaned = text.strip()
     if cleaned.startswith("```"):
-        pattern = r"^```(?:json)?\s*(.*?)\s*```$"
-        match = re.search(pattern, cleaned, re.DOTALL | re.IGNORECASE)
-        if match:
-            cleaned = match.group(1).strip()
-        else:
-            lines = cleaned.split("\n")
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].startswith("```"):
-                lines = lines[:-1]
-            cleaned = "\n".join(lines).strip()
-
-    # Fast direct parsing
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        pass
-
-    # Fallback: Extract outermost JSON object brackets { ... }
-    start_idx = cleaned.find("{")
-    end_idx = cleaned.rfind("}")
-    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-        substring = cleaned[start_idx : end_idx + 1]
-        try:
-            return json.loads(substring)
-        except json.JSONDecodeError as err:
-            logger.error("Failed to parse extracted JSON substring: %s", err)
-            raise GeminiResponseFormatError(
-                "Extracted JSON block was malformed or incomplete."
-            ) from err
-
-    raise GeminiResponseFormatError("Model response did not contain a valid JSON object.")
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(cleaned[start:end + 1])
+        raise
 
 
 class GeminiClient:
     """
-    Encapsulated client for Google Gemini API operations.
-    Keeps all SDK invocation logic, error handling, and schema validation centralized.
+    Thin wrapper around the xAI Grok API (OpenAI-compatible Chat Completions
+    endpoint). Public interface kept identical to the original Gemini-backed
+    client so app.py / job_matcher.py / cv_analyzer.py do not need to change:
+
+      - is_configured (bool property)
+      - model_name (str property)
+      - analyze_job(job_description) -> dict
+      - match_cv_to_job(cv_data, job_description) -> dict
+      - get_cv_improvement_suggestions(cv_text, job_description) -> dict
     """
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        model_name: str = DEFAULT_MODEL,
-    ):
+    def __init__(self, api_key: Optional[str] = None, model_name: Optional[str] = None):
         self.api_key = api_key or get_api_key()
-        self.model_name = model_name
-        self._sdk_client = None
+        self.model_name = model_name or DEFAULT_MODEL
+        self._client = None
+
+        if self.api_key and HAS_OPENAI_SDK:
+            try:
+                self._client = OpenAI(api_key=self.api_key, base_url=XAI_BASE_URL)
+            except Exception as exc:
+                logger.warning("Failed to initialize xAI client: %s", exc)
+                self._client = None
 
     @property
     def is_configured(self) -> bool:
-        """Return True if a valid API key string is present."""
-        return bool(self.api_key and len(self.api_key) > 5)
+        return bool(self.api_key and HAS_OPENAI_SDK and self._client is not None)
 
-    def _ensure_configured(self) -> None:
-        """Verify API key existence or raise GeminiKeyMissingError."""
+    # ------------------------------------------------------------------
+    # Internal helper
+    # ------------------------------------------------------------------
+    def _chat_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.3) -> Dict[str, Any]:
         if not self.is_configured:
             raise GeminiKeyMissingError(
-                "Gemini API key is not configured. Please set GEMINI_API_KEY in your "
-                "environment, .env file, or Streamlit secrets (.streamlit/secrets.toml)."
+                "XAI_API_KEY is not set (or the 'openai' package is not installed). "
+                "Set the XAI_API_KEY environment variable to enable live Grok calls."
             )
 
-    def _get_sdk_client(self):
-        """Lazy initialization of the official google.genai Client."""
-        if self._sdk_client is not None:
-            return self._sdk_client
-
-        self._ensure_configured()
-
         try:
-            from google import genai
-            self._sdk_client = genai.Client(api_key=self.api_key)
-            return self._sdk_client
-        except ImportError:
-            logger.warning(
-                "The 'google-genai' package is not installed. Falling back to HTTP REST interface."
+            response = self._client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+                response_format={"type": "json_object"},
             )
-            return None
-
-    def generate_json_response(
-        self,
-        system_instruction: str,
-        user_prompt: str,
-        schema_class: Optional[Any] = None,
-    ) -> Dict[str, Any]:
-        """
-        Send prompt to Gemini requesting structured JSON.
-        Validates returned structure against optional schema_class.
-        Handles API errors, rate limits, and format defects gracefully.
-        """
-        self._ensure_configured()
-
-        # 1. Try modern google-genai SDK
-        client = self._get_sdk_client()
-        raw_text = ""
-
-        if client is not None:
-            try:
-                from google.genai import types
-
-                response = client.models.generateContent(
-                    model=self.model_name,
-                    contents=user_prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        response_mime_type="application/json",
-                        temperature=0.2,
-                    ),
-                )
-                raw_text = response.text or ""
-            except Exception as exc:
-                err_str = str(exc)
-                logger.error("Gemini SDK call failed: %s", err_str)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    raise GeminiRateLimitError(
-                        "Gemini API rate limit exceeded. Please wait a moment before trying again."
-                    ) from exc
-                elif "API_KEY_INVALID" in err_str or "403" in err_str or "PERMISSION_DENIED" in err_str:
-                    raise GeminiError(
-                        "The configured Gemini API key is invalid or unauthorized."
-                    ) from exc
-                else:
-                    raise GeminiError(f"Gemini API error: {err_str}") from exc
-        else:
-            # 2. Fallback to direct HTTPS REST call if SDK is missing
-            raw_text = self._call_via_rest(system_instruction, user_prompt)
-
-        # Parse and sanitize JSON
-        parsed_dict = clean_and_parse_json(raw_text)
-
-        # Validate against schema if provided
-        if schema_class is not None:
-            parsed_dict = validate_schema(schema_class, parsed_dict)
-
-        return parsed_dict
-
-    def _call_via_rest(self, system_instruction: str, user_prompt: str) -> str:
-        """Fallback REST caller when google-genai library is not yet installed."""
-        import urllib.request
-        import urllib.error
-
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.model_name}:generateContent?key={self.api_key}"
-        )
-        payload = {
-            "system_instruction": {"parts": [{"text": system_instruction}]},
-            "contents": [{"parts": [{"text": user_prompt}]}],
-            "generationConfig": {
-                "response_mime_type": "application/json",
-                "temperature": 0.2,
-            },
-        }
-        req_data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=req_data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=35) as resp:
-                resp_json = json.loads(resp.read().decode("utf-8"))
-                candidates = resp_json.get("candidates", [])
-                if not candidates:
-                    raise GeminiResponseFormatError("No content candidates returned by Gemini API.")
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if not parts or "text" not in parts[0]:
-                    raise GeminiResponseFormatError("No text parts returned in candidate response.")
-                return parts[0]["text"]
-        except urllib.error.HTTPError as http_err:
-            body = http_err.read().decode("utf-8", errors="ignore")
-            logger.error("Gemini REST call failed: HTTP %s - %s", http_err.code, body)
-            if http_err.code == 429:
-                raise GeminiRateLimitError("Gemini API rate limit exceeded.") from http_err
-            elif http_err.code in (400, 403):
-                raise GeminiError("Gemini API request was unauthorized or malformed.") from http_err
-            raise GeminiError(f"Gemini REST error (HTTP {http_err.code}): {body}") from http_err
+        except _OpenAIRateLimitError as exc:
+            raise GeminiRateLimitError(f"xAI rate limit hit: {exc}") from exc
+        except APIError as exc:
+            raise GeminiError(f"xAI API error: {exc}") from exc
         except Exception as exc:
-            logger.error("REST connection error: %s", exc)
-            raise GeminiError(f"Connection to Gemini API failed: {exc}") from exc
+            raise GeminiError(f"Unexpected error calling xAI API: {exc}") from exc
 
-    def analyze_cv(self, cv_text: str) -> Dict[str, Any]:
-        """
-        Analyze raw CV text and extract structured CVProfile.
-        Validates schema and ensures no credentials are fabricated.
-        """
-        if not cv_text or len(cv_text.strip()) < 20:
-            raise ValueError("CV text is too short to perform meaningful analysis.")
+        content = response.choices[0].message.content
+        try:
+            return _extract_json(content)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise GeminiError(f"xAI response was not valid JSON: {exc}") from exc
 
-        prompt = CV_ANALYSIS_USER_PROMPT.format(cv_text=cv_text)
-        return self.generate_json_response(
-            system_instruction=CV_ANALYSIS_SYSTEM_PROMPT,
-            user_prompt=prompt,
-            schema_class=CVProfile,
-        )
-
+    # ------------------------------------------------------------------
+    # Public methods expected by the rest of the app
+    # ------------------------------------------------------------------
     def analyze_job(self, job_description: str) -> Dict[str, Any]:
-        """
-        Analyze raw Job Description and extract structured JobProfile.
-        """
-        if not job_description or len(job_description.strip()) < 20:
-            raise ValueError("Job Description text is too short to analyze.")
-
-        prompt = JOB_ANALYSIS_USER_PROMPT.format(job_description=job_description)
-        return self.generate_json_response(
-            system_instruction=JOB_ANALYSIS_SYSTEM_PROMPT,
-            user_prompt=prompt,
-            schema_class=JobProfile,
+        """Extract a structured JobProfile from a raw job description via Grok."""
+        system_prompt = (
+            "You are an expert technical recruiter. Extract a structured job profile "
+            "from the job description as a single JSON object with keys: "
+            "title (string), required_skills (array of strings), preferred_skills "
+            "(array of strings), responsibilities (array of strings), "
+            "experience_requirements (string), education_requirements (string), "
+            "certifications (array of strings), keywords (array of strings). "
+            "Respond with ONLY the JSON object, no commentary."
         )
+        return self._chat_json(system_prompt, job_description)
 
-    def match_cv_to_job(
-        self,
-        cv_data: Dict[str, Any],
-        job_description: str,
-    ) -> Dict[str, Any]:
-        """
-        Compare candidate CV profile against a target Job Description.
-        Returns validated MatchResult schema.
-        """
-        if not job_description or len(job_description.strip()) < 20:
-            raise ValueError("Job Description text is required for matching.")
-
-        # Prepare clear textual summary of candidate profile for prompt
-        work_exp = cv_data.get("experience") or cv_data.get("work_experience") or []
-        exp_summary = "; ".join([
-            f"{e.get('role', '')} at {e.get('company', '')} ({e.get('duration', '')})"
-            for e in work_exp if isinstance(e, dict)
-        ])
-        edu_list = cv_data.get("education") or []
-        edu_summary = "; ".join([
-            f"{ed.get('degree', '')} from {ed.get('institution', '')}"
-            for ed in edu_list if isinstance(ed, dict)
-        ])
-        proj_list = cv_data.get("projects") or []
-        proj_summary = "; ".join([
-            f"{p.get('name', '')}: {p.get('description', '')}"
-            for p in proj_list if isinstance(p, dict)
-        ])
-        cert_list = cv_data.get("certifications") or []
-        cert_summary = ", ".join([str(c) for c in cert_list if c]) if cert_list else "None listed."
-
-        tech_skills = cv_data.get("technical_skills") or cv_data.get("skills") or []
-        tech_skills_str = ", ".join([str(s) for s in tech_skills if s]) if tech_skills else "None listed."
-        soft_skills = cv_data.get("soft_skills") or []
-        soft_skills_str = ", ".join([str(s) for s in soft_skills if s]) if soft_skills else "None listed."
-
-        prompt = JOB_MATCH_USER_PROMPT.format(
-            cv_name=cv_data.get("name", "Candidate"),
-            cv_summary=cv_data.get("summary") or cv_data.get("professional_summary", ""),
-            cv_yoe=str(cv_data.get("total_experience_years") or cv_data.get("years_of_experience") or "Not specified"),
-            cv_tech_skills=tech_skills_str,
-            cv_soft_skills=soft_skills_str,
-            cv_experience_summary=exp_summary or "No specific work history listed.",
-            cv_education_summary=edu_summary or "No formal education listed.",
-            cv_projects_summary=proj_summary or "No projects listed.",
-            cv_certifications=cert_summary,
-            job_description=job_description,
+    def match_cv_to_job(self, cv_data: Dict[str, Any], job_description: str) -> Dict[str, Any]:
+        """Produce a MatchResult-shaped dict comparing a CV profile to a job description."""
+        system_prompt = (
+            "You are an objective, non-discriminatory CV-to-job matching engine. "
+            "Given a candidate's CV profile (JSON) and a job description, evaluate ONLY "
+            "verified textual evidence in the CV. NEVER factor in protected "
+            "characteristics (name, gender, age, photo, nationality, religion, "
+            "ethnicity, etc.). Never invent skills, experience, or credentials. "
+            "Respond with a single JSON object containing: overall_score (0-100 int), "
+            "compatibility_label (string), matching_skills (array), "
+            "partially_matching_skills (array), missing_skills (array), "
+            "experience_match (string), education_match (string), "
+            "project_relevance (string), strengths (array of strings), "
+            "weaknesses_and_gaps (array of strings), recommendations (array of strings), "
+            "why_matched (string), biggest_gaps (string), "
+            "score_calculation_explanation (string). "
+            "Respond with ONLY the JSON object, no commentary."
         )
-
-        return self.generate_json_response(
-            system_instruction=JOB_MATCH_SYSTEM_PROMPT,
-            user_prompt=prompt,
-            schema_class=MatchResult,
+        user_prompt = (
+            f"CANDIDATE CV PROFILE (JSON):\n{json.dumps(cv_data, default=str)}\n\n"
+            f"JOB DESCRIPTION:\n{job_description}"
         )
+        return self._chat_json(system_prompt, user_prompt)
 
-    def get_cv_improvement_suggestions(
-        self,
-        cv_text: str,
-        job_description: str,
-    ) -> Dict[str, Any]:
-        """
-        Generate honest, non-fabricated CV improvement and bullet point suggestions.
-        Returns validated CVImprovementResult schema.
-        """
-        if not cv_text or not job_description:
-            raise ValueError("Both CV text and target Job Description are required.")
-
-        prompt = CV_IMPROVEMENT_USER_PROMPT.format(
-            cv_text=cv_text,
-            job_description=job_description,
+    def get_cv_improvement_suggestions(self, cv_text: str, job_description: str) -> Dict[str, Any]:
+        """Produce truthful, ethical CV tailoring suggestions for a target job."""
+        system_prompt = (
+            "You are an ethical resume coach. Suggest CV improvements strictly "
+            "derived from the candidate's real, provided experience. NEVER fabricate "
+            "roles, employers, degrees, or metrics. Respond with a single JSON object "
+            "containing: missing_keywords (array of strings), skills_to_emphasize "
+            "(array of strings), weak_sections (array of strings), "
+            "suggested_bullet_point_improvements (array of objects, each with "
+            "original_or_section, suggested_revision, reason), "
+            "tailoring_recommendations (array of strings), ethical_guidance (string). "
+            "Respond with ONLY the JSON object, no commentary."
         )
-
-        return self.generate_json_response(
-            system_instruction=CV_IMPROVEMENT_SYSTEM_PROMPT,
-            user_prompt=prompt,
-            schema_class=CVImprovementResult,
-        )
+        user_prompt = f"CANDIDATE CV TEXT:\n{cv_text}\n\nTARGET JOB DESCRIPTION:\n{job_description}"
+        return self._chat_json(system_prompt, user_prompt)
